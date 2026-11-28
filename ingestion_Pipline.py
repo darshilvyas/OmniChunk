@@ -8,18 +8,31 @@ from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 import chromadb
 import hashlib
+import torch
+import math
+import time
+
 
 load_dotenv()
 
 aiClient = genai.Client(api_key=os.environ['GOOGLE_API_KEY'])
-client = chromadb.PersistentClient(path="./video_db")
+client = chromadb.PersistentClient(path="./Vision_RAG/video_db")
 frame_col = client.get_or_create_collection(
     name="frames", metadata={"hnsw:space": "cosine"}
 )
 chunk_col = client.get_or_create_collection(
     name="video_chunks", metadata={"hnsw:space": "cosine"})
 
-model =SentenceTransformer("google/embeddinggemma-2")
+# load initally For faster throughput
+model = SentenceTransformer(
+    "google/embeddinggemma-2",
+    device="cuda",
+    model_kwargs={"dtype": torch.bfloat16},
+)
+print(model.device)   # should print cuda:0
+
+# warm-up the first call is always slow
+model.encode([{"image": Image.new("RGB", (224, 224))}])
 WORKSPACE_PATH = "./Vision_RAG/video"
 
 def is_workspace_ready():
@@ -29,35 +42,34 @@ def is_workspace_ready():
 # need to handel by flask
 # def get_video(video_path:str): 
     
-def get_video_frame(video_path=r"C:\Users\darsh\Downloads\03_Videos\Stock_Footage\Cinematic_Green_Screen_TV_Intro.mp4"):
-
+def process_video_frame(video_path=r"C:\Users\darsh\Downloads\03_Videos\Stock_Footage\Cinematic_Green_Screen_TV_Intro.mp4"):
+    print("START PROCESSING...")
     video_name = Path(video_path).stem  
-    interval=1
-    timestamp=0
-    counter=1
-    Chunk_ID=0
-    PIL_Image=[]
+    PIL_frames=[]
+    chunk_id=0
     cap = cv2.VideoCapture(video_path)
     total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
     fps = cap.get(cv2.CAP_PROP_FPS)
     duration = total_frames/fps
     print("Duration-->",duration,"\n FPS-->",fps,"\nTOTAL_FRAME-->",total_frames)
-    while timestamp < duration:
-        cap.set(cv2.CAP_PROP_POS_MSEC,timestamp * 1000)
+    for sec in range(math.ceil(duration)):
+        cap.set(cv2.CAP_PROP_POS_MSEC,sec * 1000)
         sucess,frame = cap.read()
         if sucess:
-            if(counter==5):
-                index_5sec_chunk(video_name,video_path, Chunk_ID, PIL_Image)
-           
-                # reset this list and counter for next batch
-                counter=1
-                PIL_Image=[]
-            else:
-                rgb = cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
-                PIL_Image.append(Image.fromarray(rgb))
-               
-            timestamp +=interval
-            counter+=1
+            rgb = cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
+            PIL_frames.append(Image.fromarray(rgb))              
+
+            if len(PIL_frames) == 5:
+                print("Processing Chunk --->",chunk_id)
+                print("Processing NO of Frames --->",len(PIL_frames))
+                index_5sec_chunk(video_name, video_path, chunk_id, PIL_frames)
+                chunk_id += 1
+                PIL_frames= []   
+        else:
+            break
+    # call for left frames 
+    if PIL_frames:
+                index_5sec_chunk(video_name, video_path, chunk_id, PIL_frames)       
     cap.release()
 
 
@@ -96,10 +108,11 @@ def summurize_frame(images):
     section out completely. Never write things like "no people present", "none visible",
     "not applicable", or "N/A".
     - Mention only what is actually in the frames."""
-    print("Start...")
+    print("Start AI SUMMARY...")
     response = aiClient.models.generate_content(
     model="gemini-3.5-flash-lite",
     contents=[*images, PROMPT.format(n=len(images))],)
+    print("STOP ai summary ->",response.text)
     return response.text
 
 
@@ -108,7 +121,7 @@ def get_frame(n,k=2):
     if n<=k:
         return list(range(n))
 
-    return [round((i+0.5)*(n/k)/0.5) for i in range(k)]
+    return [round((i+0.5)*(n/k)-0.5) for i in range(k)]
 
 
 
@@ -122,10 +135,16 @@ def index_5sec_chunk(video_name,video_path, chunk_idx, pil_frames):
     chunk_id = f"{vid_id}_chunk_{chunk_idx}"
     start_sec = chunk_idx * 5
     frame_inputs = [{"image":frm} for frm in pil_frames]
+    print("START ENCODING....")
+    t = time.perf_counter()
     frame_embs = model.encode(frame_inputs, batch_size=5, normalize_embeddings=True)
+    print("encode:", round(time.perf_counter() - t, 2))
+    print("STOP ENCODING...")
 
     # summarize the frame into Captions For Summary Vector for Better Context Aware Findings..
+    t = time.perf_counter()
     caption= summurize_frame([pil_frames[i] for i in get_frame(len(pil_frames))])
+    print("aiiii:", round(time.perf_counter() - t, 2))
     cap_embd = model.encode([caption],normalize_embeddings=True)[0]
 
 
@@ -154,24 +173,15 @@ def index_5sec_chunk(video_name,video_path, chunk_idx, pil_frames):
     # store 5 individual frame in seprate collection
     sec_list = [start_sec + i for i in range(len(frame_embs))]
     frame_col.add(
-    ids=[f"{vid_id}_f{s}" for s in sec_list],
-    embeddings=frame_embs.tolist(),
-    metadatas=[{"vid_id": vid_id, "sec": s} for s in sec_list],
+        ids=[f"{vid_id}_f{s}" for s in sec_list],
+        embeddings=frame_embs.tolist(),
+        metadatas=[{"vid_id": vid_id, "sec": s} for s in sec_list],
     )
+    return
 
-    
-
-    
-
-def process_embbedings():
-    # now used 5-5 elments embbedings converts into chunks 
-    pass
-
-# is_workspace_ready()
-# get_video_frame()
-
-
-# f = Image.open("Vision_RAG/video/FRAME_2.jpg")
-
-# print(summurize_frame([f]))
-
+if __name__ == '__main__':
+    process_video_frame()
+    # print(get_frame(5))
+    # print(torch.cuda.is_available())      
+    # print(torch.__version__)              
+    # print(torch.cuda.get_device_name(0))  
